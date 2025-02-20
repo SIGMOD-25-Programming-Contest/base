@@ -1,0 +1,8 @@
+/.vscode
+/build
+/imdb
+/output*.txt
+/*.tgz
+/*.db
+/TPC-H*
+/job-sample
