@@ -141,3 +141,23 @@ Now, you can run the tests:
 > ./build/Release/build_database imdb.db
 > ./build/Release/run plans.json
 > ```
+
+# Hardware
+
+The evaluation is automatically executed on four different servers. On multi-socket machines, the benchmarks are bound to a single socket (using `numactl -m 0 -N -`).
+
+ * **Intel #1**
+    * CPU: 4x Intel Xeon E7-4880 v2 (SMT 2, 15 cores, 30 threads)
+    * Main memory: 512 GB
+ * **AMD #1**
+    * CPU: 2x AMD EPYC 7F72 (SMT 2, 24 cores, 48 threads)
+    * Main memory: 256 GB
+ * **IBM #1**
+    * CPU: 8x IBM Power8 (SMT 8, 12 cores, 96 threads)
+    * Main memory: 1024 GB
+ * **ARM #1**
+    * CPU: 1x Ampere Altra Max (SMT 1, 128 cores, 128 threads)
+    * Main memory: 512 GB
+
+
+For the final evaluation after the submission deadline, four additional servers will be included. These additional servers cover the same platforms but might differ in the supported feature set as they can be significantly older or newer than the initial servers.
