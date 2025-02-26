@@ -144,7 +144,7 @@ Now, you can run the tests:
 
 # Hardware
 
-The evaluation is automatically executed on four different servers. On multi-socket machines, the benchmarks are bound to a single socket (using `numactl -m 0 -N -`).
+The evaluation is automatically executed on four different servers. On multi-socket machines, the benchmarks are bound to a single socket (using `numactl -m 0 -N 0`).
 
  * **Intel #1**
     * CPU: 4x Intel Xeon E7-4880 v2 (SMT 2, 15 cores, 30 threads)
