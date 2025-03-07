@@ -1,14 +1,15 @@
 #include <array>
-#include <fmt/core.h>
 #include <fstream>
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
 
+#include <inner_column.h>
 #include <plan.h>
 #include <table.h>
 #include <table_entity.h>
 
+#include <fmt/core.h>
 #include <nlohmann/json.hpp>
 
 #include <SQLParser.h>
@@ -1103,7 +1104,7 @@ Plan load_join_pipeline(const json& node, const ParsedSQL& parsed_sql) {
             auto table        = Table::from_csv(*pattributes,
                 fs::path("imdb") / fmt::format("{}.csv", entity.table),
                 filter);
-            auto new_input_id = ret.new_input(table.to_columnar());
+            auto new_input_id = ret.new_input(std::move(table));
             // auto new_input_id = ret.new_table(std::move(table));
             std::vector<std::tuple<TableEntity, std::string, DataType>> output_columns;
             std::vector<std::tuple<size_t, DataType>>                   output_attrs;
@@ -1205,13 +1206,26 @@ bool compare(duckdb::MaterializedQueryResult& duckdb_results, const ColumnarTabl
     auto result_table = Table::from_columnar(results);
     sort(duckdb_table);
     sort(result_table.table());
-    return duckdb_table == result_table.table();
+    std::vector<uint8_t> booleans(num_rows, 0);
+    auto task = [&](size_t begin, size_t end) {
+        for (size_t i = begin; i < end; ++i) {
+            booleans[i] = uint8_t(result_table.table()[i] == duckdb_table[i]);
+        }
+    };
+    filter_tp.run(task, num_rows);
+    for (auto v: booleans) {
+        if (not v) {
+            return false;
+        }
+    }
+    return true;
 }
 
 std::pair<bool, size_t> run(const std::unordered_map<std::string, std::vector<std::string>>& column_to_tables,
     std::string_view                                                      name,
     std::string                                                           sql,
     const json&                                                           plan_json,
+    duckdb::Connection&                                                   conn,
     [[maybe_unused]] void*                                                context) {
     ParsedSQL parsed_sql(column_to_tables);
     parsed_sql.parse_sql(sql, name);
@@ -1223,9 +1237,6 @@ std::pair<bool, size_t> run(const std::unordered_map<std::string, std::vector<st
 
     auto executed_sql = parsed_sql.executed_sql(sql);
     // fmt::println("{}", executed_sql);
-    using namespace duckdb;
-    DuckDB     db("imdb.db");
-    Connection conn(db);
     auto       result = conn.Query(executed_sql);
 
     const auto compare_result = compare(*result, results);
@@ -1244,10 +1255,10 @@ int main(int argc, char* argv[]) {
     try {
         if (argc < 2) {
             // We accept several plans to run. For now, the last one of them might be `output_filename`  in which
-	    // case we write the runtime result to this fiile.
+            // case we write the runtime result to this file.
             fmt::println(stderr, "{} <path to plans> [<name of selected sql>] [{}]", argv[0], output_filename);
         }
-	
+  
         // column to table map
         std::unordered_map<std::string, std::vector<std::string>> column_to_tables;
 
@@ -1263,45 +1274,53 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // build context
+        auto runtime = size_t{0};
+
+        // Build context. Context creation time is included in the measured runtime.
+        const auto start_context = std::chrono::steady_clock::now();
         auto* context = Contest::build_context();
+        const auto end_context = std::chrono::steady_clock::now();
+        runtime += std::chrono::duration_cast<std::chrono::microseconds>(end_context - start_context).count();
 
         // load plan json
         namespace fs = std::filesystem;
 
-	auto write_output_file = false;
-	auto selected_plans = std::unordered_set<std::string>{};
-	for (auto argument_id = int{0}; argument_id < argc; ++argument_id) {
-	    if (argument_id == argc - 1 && std::string{argv[argument_id]} == output_filename) {
+        auto write_output_file = false;
+        auto selected_plans = std::unordered_set<std::string>{};
+        for (auto argument_id = int{0}; argument_id < argc; ++argument_id) {
+            if (argument_id == argc - 1 && std::string{argv[argument_id]} == output_filename) {
                 write_output_file = true;
-		break;
-	    }
-	    selected_plans.emplace(argv[argument_id]);
-	}
+                break;
+            }
+            selected_plans.emplace(argv[argument_id]);
+        }
 
         File file(argv[1], "rb");
         json query_plans   = json::parse(file);
         auto sql_directory = query_plans["sql_directory"].get<std::string>();
         auto names         = query_plans["names"].get<std::vector<std::string>>();
         auto plans         = query_plans["plans"];
-	auto runtime = size_t{0};
-	auto all_queries_succeeded = true;
+  
+        auto all_queries_succeeded = true;
+        using namespace duckdb;
+        DuckDB     db("imdb.db");
+        Connection conn(db);
         for (const auto& [name, plan_json]: views::zip(names, plans)) {
             if ((argc < 3 || (selected_plans.find(name) != selected_plans.end())) ||
                 (argc == 3 && std::string{argv[2]} == output_filename)) {
                 auto sql_path = fs::path(sql_directory) / fmt::format("{}.sql", name);
                 auto sql      = read_file(sql_path);
-                const auto [result_is_correct, query_runtime] = run(column_to_tables, name, std::move(sql), plan_json, context);
-		runtime += query_runtime;
-		all_queries_succeeded &= result_is_correct;
+                const auto [result_is_correct, query_runtime] = run(column_to_tables, name, std::move(sql), plan_json, conn, context);
+                runtime += query_runtime;
+                all_queries_succeeded &= result_is_correct;
             }
         }
 
-	if (write_output_file) {
+        if (write_output_file) {
             auto output_file = std::ofstream(output_filename);
-	    output_file << runtime;
-	    output_file.close();
-	}
+            output_file << runtime;
+            output_file.close();
+        }
 
         // destroy context
         Contest::destroy_context(context);

@@ -1,10 +1,9 @@
-// #include <print>
-// #include <ranges>
-
+#include <atomic>
 #include <charconv>
 
 #include <common.h>
 #include <csv_parser.h>
+#include <inner_column.h>
 #include <plan.h>
 #include <table.h>
 
@@ -89,32 +88,141 @@ TableParser(const std::vector<Attribute>& attributes,
 
 char buffer[1024 * 1024];
 
-std::unordered_map<std::filesystem::path, std::vector<std::vector<Data>>> table_cache;
+std::unordered_map<std::filesystem::path, InnerTable>    table_cache;
+std::unordered_map<std::filesystem::path, ColumnarTable> result_cache;
 
-Table Table::from_csv(const std::vector<Attribute>& attributes,
-    const std::filesystem::path&                    path,
-    Statement*                                      filter,
-    bool                                            header) {
-    std::vector<std::vector<Data>> filtered_table;
+template <class T>
+size_t from_inner_to_column(const InnerColumnBase* inner,
+    Column&                                        column,
+    const std::vector<uint8_t>&                    results,
+    size_t                                         rows) {
+    auto*  c        = reinterpret_cast<const InnerColumn<T>*>(inner);
+    auto   inserter = ColumnInserter<T>(column);
+    size_t ret      = 0;
+    bool   first    = true;
+    for (size_t i = 0; i < rows; ++i) {
+        size_t  byte_idx    = i / 8;
+        size_t  bit_idx     = i % 8;
+        uint8_t eval_result = results[byte_idx] & (0x1 << bit_idx);
+        if (eval_result) {
+            if (c->is_not_null(i)) {
+                auto value = c->get(i);
+                inserter.insert(value);
+            } else {
+                inserter.insert_null();
+            }
+            ++ret;
+        }
+    }
+    inserter.finalize();
+    return ret;
+}
+
+ColumnarTable copy(const ColumnarTable& value) {
+    ColumnarTable ret;
+    ret.num_rows = value.num_rows;
+    for (auto& column: value.columns) {
+        ret.columns.emplace_back(column.type);
+        auto& last_column = ret.columns.back();
+        for (auto* page: column.pages) {
+            auto* last_page = last_column.new_page();
+            memcpy(last_page->data, page->data, PAGE_SIZE);
+        }
+    }
+    return ret;
+}
+
+ColumnarTable Table::from_csv(const std::vector<Attribute>& attributes,
+    const std::filesystem::path&                            path,
+    Statement*                                              filter,
+    bool                                                    header) {
+    namespace views = ranges::views;
+    InnerTableView                    table;
+    std::vector<std::vector<Data>>    ground_truth;
+    decltype(result_cache.find(path)) result_itr;
+    if (not filter
+        and (result_itr = result_cache.find(path), result_itr != result_cache.end())) {
+        // fmt::println("    result cache hit");
+        return copy(result_itr->second);
+    }
     if (auto itr = table_cache.find(path); itr != table_cache.end()) {
-        const auto& full_table = itr->second;
-        if (not filter) {
-            filtered_table = full_table;
-        } else {
-            for (auto& record: full_table) {
-                if (filter->eval(record)) {
-                    filtered_table.emplace_back(record);
-                }
+        // fmt::println("    cache hit");
+        table = itr->second;
+    } else {
+        // fmt::println("    cache miss");
+        InnerTable full_table;
+        full_table.rows = 0;
+        for (const auto& attr: attributes) {
+            switch (attr.type) {
+            case DataType::INT32: {
+                full_table.columns.emplace_back(std::make_unique<InnerColumn<int32_t>>());
+                break;
+            }
+            case DataType::INT64: {
+                full_table.columns.emplace_back(std::make_unique<InnerColumn<int64_t>>());
+                break;
+            }
+            case DataType::FP64: {
+                full_table.columns.emplace_back(std::make_unique<InnerColumn<double>>());
+                break;
+            }
+            case DataType::VARCHAR: {
+                full_table.columns.emplace_back(std::make_unique<InnerColumn<std::string>>());
+                break;
+            }
             }
         }
-    } else {
-        std::vector<std::vector<Data>> full_table;
-        File                           fp(path, "rb");
-        auto add_record = [&full_table, &filtered_table, attributes, filter](
+        File fp(path, "rb");
+        auto add_record = [&ground_truth, &full_table, &attributes, filter](
                               std::vector<Data>&& record) {
-            full_table.emplace_back(record);
-            if (not filter or filter->eval(record)) {
-                filtered_table.emplace_back(std::move(record));
+            full_table.rows += 1;
+            for (const auto& [idx, field]: record | views::enumerate) {
+                switch (attributes[idx].type) {
+                case DataType::INT32: {
+                    auto* column =
+                        reinterpret_cast<InnerColumn<int32_t>*>(full_table.columns[idx].get());
+                    auto* data = std::get_if<int32_t>(&field);
+                    if (data) {
+                        column->push_back(*data);
+                    } else {
+                        column->push_back_null();
+                    }
+                    break;
+                }
+                case DataType::INT64: {
+                    auto* column =
+                        reinterpret_cast<InnerColumn<int64_t>*>(full_table.columns[idx].get());
+                    auto* data = std::get_if<int64_t>(&field);
+                    if (data) {
+                        column->push_back(*data);
+                    } else {
+                        column->push_back_null();
+                    }
+                    break;
+                }
+                case DataType::FP64: {
+                    auto* column =
+                        reinterpret_cast<InnerColumn<double>*>(full_table.columns[idx].get());
+                    auto* data = std::get_if<double>(&field);
+                    if (data) {
+                        column->push_back(*data);
+                    } else {
+                        column->push_back_null();
+                    }
+                    break;
+                }
+                case DataType::VARCHAR: {
+                    auto* column = reinterpret_cast<InnerColumn<std::string>*>(
+                        full_table.columns[idx].get());
+                    auto* data = std::get_if<std::string>(&field);
+                    if (data) {
+                        column->push_back(*data);
+                    } else {
+                        column->push_back_null();
+                    }
+                    break;
+                }
+                }
             }
         };
         TableParser parser(attributes, std::move(add_record), '\\', ',', false, header);
@@ -133,12 +241,66 @@ Table Table::from_csv(const std::vector<Attribute>& attributes,
         if (err != CSVParser::Ok) {
             throw std::runtime_error("CSV parse error");
         }
-        table_cache.emplace(path, full_table);
+        auto [iter, _] = table_cache.emplace(path, std::move(full_table));
+        table          = iter->second;
     }
-    Table table;
-    table.set_attributes(attributes);
-    table.data_ = std::move(filtered_table);
-    return table;
+    ColumnarTable        ret;
+    std::vector<uint8_t> results;
+    if (filter) {
+        results = filter->eval(table.columns);
+    } else {
+        results.resize((table.rows + 7) / 8, 0xff);
+    }
+    ret.num_rows = 0;
+    for (auto* column: table.columns) {
+        ret.columns.emplace_back(column->type);
+    }
+    std::atomic_size_t ret_rows;
+    auto               task = [&table, &ret, &results, &ret_rows](size_t begin, size_t end) {
+        for (size_t column_idx = begin; column_idx < end; ++column_idx) {
+            auto* column = table.columns[column_idx];
+            switch (column->type) {
+            case DataType::INT32: {
+                auto filtered_rows = from_inner_to_column<int32_t>(column,
+                    ret.columns[column_idx],
+                    results,
+                    table.rows);
+                ret_rows.store(filtered_rows, std::memory_order_relaxed);
+                break;
+            }
+            case DataType::INT64: {
+                auto filtered_rows = from_inner_to_column<int64_t>(column,
+                    ret.columns[column_idx],
+                    results,
+                    table.rows);
+                ret_rows.store(filtered_rows, std::memory_order_relaxed);
+                break;
+            }
+            case DataType::FP64: {
+                auto filtered_rows = from_inner_to_column<double>(column,
+                    ret.columns[column_idx],
+                    results,
+                    table.rows);
+                ret_rows.store(filtered_rows, std::memory_order_relaxed);
+                break;
+            }
+            case DataType::VARCHAR: {
+                auto filtered_rows = from_inner_to_column<std::string>(column,
+                    ret.columns[column_idx],
+                    results,
+                    table.rows);
+                ret_rows.store(filtered_rows, std::memory_order_relaxed);
+                break;
+            }
+            }
+        }
+    };
+    filter_tp.run(task, table.columns.size());
+    ret.num_rows = ret_rows.load(std::memory_order_relaxed);
+    if (not filter) {
+        result_cache.emplace(path, copy(ret));
+    }
+    return ret;
 }
 
 bool get_bitmap(const uint8_t* bitmap, uint16_t idx) {
@@ -149,121 +311,127 @@ bool get_bitmap(const uint8_t* bitmap, uint16_t idx) {
 
 Table Table::from_columnar(const ColumnarTable& table) {
     namespace views = ranges::views;
-    std::vector<std::vector<Data>> columns;
-    columns.reserve(table.columns.size());
-    std::vector<DataType> types;
-    types.reserve(table.columns.size());
-    for (const auto& [col_idx, column]: table.columns | views::enumerate) {
-        types.emplace_back(column.type);
-        std::vector<Data> new_column;
-        new_column.reserve(table.num_rows);
-        for (auto* page:
-            column.pages | views::transform([](auto* page) { return page->data; })) {
-            switch (column.type) {
-            case DataType::INT32: {
-                auto  num_rows   = *reinterpret_cast<uint16_t*>(page);
-                auto* data_begin = reinterpret_cast<int32_t*>(page + 4);
-                auto* bitmap =
-                    reinterpret_cast<uint8_t*>(page + PAGE_SIZE - (num_rows + 7) / 8);
-                uint16_t data_idx = 0;
-                for (uint16_t i = 0; i < num_rows; ++i) {
-                    if (get_bitmap(bitmap, i)) {
-                        auto value = data_begin[data_idx++];
-                        new_column.emplace_back(value);
-                    } else {
-                        new_column.emplace_back(std::monostate{});
-                    }
-                }
-                break;
-            }
-            case DataType::INT64: {
-                auto  num_rows   = *reinterpret_cast<uint16_t*>(page);
-                auto* data_begin = reinterpret_cast<int64_t*>(page + 8);
-                auto* bitmap =
-                    reinterpret_cast<uint8_t*>(page + PAGE_SIZE - (num_rows + 7) / 8);
-                uint16_t data_idx = 0;
-                for (uint16_t i = 0; i < num_rows; ++i) {
-                    if (get_bitmap(bitmap, i)) {
-                        auto value = data_begin[data_idx++];
-                        new_column.emplace_back(value);
-                    } else {
-                        new_column.emplace_back(std::monostate{});
-                    }
-                }
-                break;
-            }
-            case DataType::FP64: {
-                auto  num_rows   = *reinterpret_cast<uint16_t*>(page);
-                auto* data_begin = reinterpret_cast<double*>(page + 8);
-                auto* bitmap =
-                    reinterpret_cast<uint8_t*>(page + PAGE_SIZE - (num_rows + 7) / 8);
-                uint16_t data_idx = 0;
-                for (uint16_t i = 0; i < num_rows; ++i) {
-                    if (get_bitmap(bitmap, i)) {
-                        auto value = data_begin[data_idx++];
-                        new_column.emplace_back(value);
-                    } else {
-                        new_column.emplace_back(std::monostate{});
-                    }
-                }
-                break;
-            }
-            case DataType::VARCHAR: {
-                auto num_rows = *reinterpret_cast<uint16_t*>(page);
-                if (num_rows == 0xffff) {
-                    auto        num_chars  = *reinterpret_cast<uint16_t*>(page + 2);
-                    auto*       data_begin = reinterpret_cast<char*>(page + 4);
-                    std::string value{data_begin, data_begin + num_chars};
-                    new_column.emplace_back(std::move(value));
-                } else if (num_rows == 0xfffe) {
-                    auto  num_chars  = *reinterpret_cast<uint16_t*>(page + 2);
-                    auto* data_begin = reinterpret_cast<char*>(page + 4);
-                    std::visit(
-                        [data_begin, num_chars](auto& value) {
-                            using T = std::decay_t<decltype(value)>;
-                            if constexpr (std::is_same_v<T, std::string>) {
-                                value.insert(value.end(), data_begin, data_begin + num_chars);
-                            } else {
-                                throw std::runtime_error(
-                                    "long string page 0xfffe must follows a string");
-                            }
-                        },
-                        new_column.back());
-                } else {
-                    auto  num_non_null = *reinterpret_cast<uint16_t*>(page + 2);
-                    auto* offset_begin = reinterpret_cast<uint16_t*>(page + 4);
-                    auto* data_begin   = reinterpret_cast<char*>(page + 4 + num_non_null * 2);
-                    auto* string_begin = data_begin;
+    std::vector<std::vector<Data>> results(table.num_rows,
+        std::vector<Data>(table.columns.size(), std::monostate{}));
+    std::vector<DataType>          types(table.columns.size());
+    auto task = [&](size_t begin, size_t end) {
+        for (size_t column_idx = begin; column_idx < end; ++column_idx) {
+            auto& column = table.columns[column_idx];
+            types[column_idx] = column.type;
+            size_t row_idx = 0;
+            for (auto* page:
+                column.pages | views::transform([](auto* page) { return page->data; })) {
+                switch (column.type) {
+                case DataType::INT32: {
+                    auto  num_rows   = *reinterpret_cast<uint16_t*>(page);
+                    auto* data_begin = reinterpret_cast<int32_t*>(page + 4);
                     auto* bitmap =
                         reinterpret_cast<uint8_t*>(page + PAGE_SIZE - (num_rows + 7) / 8);
                     uint16_t data_idx = 0;
                     for (uint16_t i = 0; i < num_rows; ++i) {
                         if (get_bitmap(bitmap, i)) {
-                            auto        offset = offset_begin[data_idx++];
-                            std::string value{string_begin, data_begin + offset};
-                            string_begin = data_begin + offset;
-                            new_column.emplace_back(std::move(value));
+                            auto value = data_begin[data_idx++];
+                            if (row_idx >= table.num_rows) {
+                                throw std::runtime_error("row_idx");
+                            }
+                            results[row_idx++][column_idx].emplace<int32_t>(value);
                         } else {
-                            new_column.emplace_back(std::monostate{});
+                            ++row_idx;
                         }
                     }
+                    break;
                 }
-                break;
-            }
+                case DataType::INT64: {
+                    auto  num_rows   = *reinterpret_cast<uint16_t*>(page);
+                    auto* data_begin = reinterpret_cast<int64_t*>(page + 8);
+                    auto* bitmap =
+                        reinterpret_cast<uint8_t*>(page + PAGE_SIZE - (num_rows + 7) / 8);
+                    uint16_t data_idx = 0;
+                    for (uint16_t i = 0; i < num_rows; ++i) {
+                        if (get_bitmap(bitmap, i)) {
+                            auto value = data_begin[data_idx++];
+                            if (row_idx >= table.num_rows) {
+                                throw std::runtime_error("row_idx");
+                            }
+                            results[row_idx++][column_idx].emplace<int64_t>(value);
+                        } else {
+                            ++row_idx;
+                        }
+                    }
+                    break;
+                }
+                case DataType::FP64: {
+                    auto  num_rows   = *reinterpret_cast<uint16_t*>(page);
+                    auto* data_begin = reinterpret_cast<double*>(page + 8);
+                    auto* bitmap =
+                        reinterpret_cast<uint8_t*>(page + PAGE_SIZE - (num_rows + 7) / 8);
+                    uint16_t data_idx = 0;
+                    for (uint16_t i = 0; i < num_rows; ++i) {
+                        if (get_bitmap(bitmap, i)) {
+                            auto value = data_begin[data_idx++];
+                            if (row_idx >= table.num_rows) {
+                                throw std::runtime_error("row_idx");
+                            }
+                            results[row_idx++][column_idx].emplace<double>(value);
+                        } else {
+                            ++row_idx;
+                        }
+                    }
+                    break;
+                }
+                case DataType::VARCHAR: {
+                    auto num_rows = *reinterpret_cast<uint16_t*>(page);
+                    if (num_rows == 0xffff) {
+                        auto        num_chars  = *reinterpret_cast<uint16_t*>(page + 2);
+                        auto*       data_begin = reinterpret_cast<char*>(page + 4);
+                        std::string value{data_begin, data_begin + num_chars};
+                        if (row_idx >= table.num_rows) {
+                            throw std::runtime_error("row_idx");
+                        }
+                        results[row_idx++][column_idx].emplace<std::string>(std::move(value));
+                    } else if (num_rows == 0xfffe) {
+                        auto  num_chars  = *reinterpret_cast<uint16_t*>(page + 2);
+                        auto* data_begin = reinterpret_cast<char*>(page + 4);
+                        std::visit(
+                            [data_begin, num_chars](auto& value) {
+                                using T = std::decay_t<decltype(value)>;
+                                if constexpr (std::is_same_v<T, std::string>) {
+                                    value.insert(value.end(), data_begin, data_begin + num_chars);
+                                } else {
+                                    throw std::runtime_error(
+                                        "long string page 0xfffe must follows a string");
+                                }
+                            },
+                            results[row_idx - 1][column_idx]);
+                    } else {
+                        auto  num_non_null = *reinterpret_cast<uint16_t*>(page + 2);
+                        auto* offset_begin = reinterpret_cast<uint16_t*>(page + 4);
+                        auto* data_begin   = reinterpret_cast<char*>(page + 4 + num_non_null * 2);
+                        auto* string_begin = data_begin;
+                        auto* bitmap =
+                            reinterpret_cast<uint8_t*>(page + PAGE_SIZE - (num_rows + 7) / 8);
+                        uint16_t data_idx = 0;
+                        for (uint16_t i = 0; i < num_rows; ++i) {
+                            if (get_bitmap(bitmap, i)) {
+                                auto        offset = offset_begin[data_idx++];
+                                std::string value{string_begin, data_begin + offset};
+                                string_begin = data_begin + offset;
+                                if (row_idx >= table.num_rows) {
+                                    throw std::runtime_error("row_idx");
+                                }
+                                results[row_idx++][column_idx].emplace<std::string>(std::move(value));
+                            } else {
+                                ++row_idx;
+                            }
+                        }
+                    }
+                    break;
+                }
+                }
             }
         }
-        columns.emplace_back(std::move(new_column));
-    }
-    std::vector<std::vector<Data>> results;
-    results.reserve(table.num_rows);
-    for (size_t i = 0; i < table.num_rows; ++i) {
-        std::vector<Data> record;
-        record.reserve(table.columns.size());
-        for (size_t j = 0; j < table.columns.size(); ++j) {
-            record.emplace_back(columns[j][i]);
-        }
-        results.emplace_back(std::move(record));
-    }
+    };
+    filter_tp.run(task, table.columns.size());
     return {results, types};
 }
 
@@ -507,105 +675,6 @@ ColumnarTable Table::to_columnar() const {
             }
             break;
         }
-        }
-    }
-    return ret;
-}
-
-void Table::cache(const std::filesystem::path& path,
-    const std::vector<std::vector<Data>>&      data_,
-    size_t                                     num_cols) {
-    File   f(path, "wb");
-    size_t num_rows = data_.size();
-    fwrite(&num_rows, sizeof(num_rows), 1, f);
-    fwrite(&num_cols, sizeof(num_cols), 1, f);
-    for (size_t i = 0; i < num_rows; ++i) {
-        std::vector<uint8_t> row_bitmap;
-        for (size_t j = 0; j < num_cols; ++j) {
-            std::visit(
-                [&row_bitmap, j](const auto& value) {
-                    using T = std::decay_t<decltype(value)>;
-                    if constexpr (std::is_same_v<T, std::monostate>) {
-                        unset_bitmap(row_bitmap, j);
-                    } else {
-                        set_bitmap(row_bitmap, j);
-                    }
-                },
-                data_[i][j]);
-        }
-        fwrite(row_bitmap.data(), 1, row_bitmap.size(), f);
-        for (size_t j = 0; j < num_cols; ++j) {
-            std::visit(
-                [&row_bitmap, j, &f](const auto& value) {
-                    using T = std::decay_t<decltype(value)>;
-                    if constexpr (std::is_same_v<T, int32_t> or std::is_same_v<T, int64_t>
-                                  or std::is_same_v<T, double>) {
-                        fwrite(&value, sizeof(T), 1, f);
-                    } else if constexpr (std::is_same_v<T, std::string>) {
-                        size_t len = value.size();
-                        fwrite(&len, sizeof(len), 1, f);
-                        fwrite(value.data(), 1, value.size(), f);
-                    } else {
-                        // std::monostate, do nothing.
-                    }
-                },
-                data_[i][j]);
-        }
-    }
-}
-
-std::vector<std::vector<Data>> Table::load_cache(const std::filesystem::path& path,
-    const std::vector<Attribute>&                                             attributes,
-    const Statement*                                                          filter) {
-    File   f(path, "rb");
-    size_t num_rows;
-    size_t num_cols;
-    std::ignore = fread(&num_rows, sizeof(num_rows), 1, f);
-    std::ignore = fread(&num_cols, sizeof(num_cols), 1, f);
-    std::vector<std::vector<Data>> ret;
-    ret.reserve(num_rows);
-    for (size_t i = 0; i < num_rows; ++i) {
-        std::vector<uint8_t> row_bitmap((num_cols + 7) / 8);
-        std::ignore = fread(row_bitmap.data(), 1, row_bitmap.size(), f);
-        std::vector<Data> record;
-        record.reserve(num_cols);
-        for (size_t j = 0; j < num_cols; ++j) {
-            if (get_bitmap(row_bitmap.data(), j)) {
-                switch (attributes[j].type) {
-                case DataType::INT32: {
-                    int32_t value;
-                    std::ignore = fread(&value, sizeof(value), 1, f);
-                    record.emplace_back(value);
-                    break;
-                }
-                case DataType::INT64: {
-                    int64_t value;
-                    std::ignore = fread(&value, sizeof(value), 1, f);
-                    record.emplace_back(value);
-                    break;
-                }
-                case DataType::FP64: {
-                    double value;
-                    std::ignore = fread(&value, sizeof(value), 1, f);
-                    record.emplace_back(value);
-                    break;
-                }
-                case DataType::VARCHAR: {
-                    size_t      len;
-                    std::string value;
-                    std::ignore = fread(&len, sizeof(len), 1, f);
-                    value.resize(len);
-                    std::ignore = fread(value.data(), 1, value.size(), f);
-                    record.emplace_back(value);
-                    break;
-                }
-                }
-            } else {
-                record.emplace_back(std::monostate{});
-            }
-        }
-        if (not filter or filter->eval(record)) {
-            ret.emplace_back(std::move(record));
         }
     }
     return ret;

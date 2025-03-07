@@ -31,6 +31,32 @@ struct fmt::formatter<DataType> {
     }
 };
 
+#define DISPATCH_DATA_TYPE(type, TYPE, ...) \
+    do {                                    \
+        switch (type) {                     \
+        case DataType::INT32: {             \
+            using TYPE = int32_t;           \
+            __VA_ARGS__                     \
+            break;                          \
+        }                                   \
+        case DataType::INT64: {             \
+            using TYPE = int64_t;           \
+            __VA_ARGS__                     \
+            break;                          \
+        }                                   \
+        case DataType::FP64: {              \
+            using TYPE = double;            \
+            __VA_ARGS__                     \
+            break;                          \
+        }                                   \
+        case DataType::VARCHAR: {           \
+            using TYPE = std::string;       \
+            __VA_ARGS__                     \
+            break;                          \
+        }                                   \
+        }                                   \
+    } while (0)
+
 struct Attribute {
     DataType    type;
     std::string name;

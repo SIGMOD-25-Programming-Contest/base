@@ -40,7 +40,7 @@ FetchContent_MakeAvailable(json)
 
 FetchContent_Declare(
     sql-parser
-    URL https://github.com/a858438680/sql-parser/archive/refs/tags/win-port-1.tar.gz
+    URL https://github.com/a858438680/sql-parser/archive/refs/tags/win-port-2.tar.gz
 )
 set(HSQL_ENABLE_WERROR OFF)
 FetchContent_MakeAvailable(sql-parser)
@@ -63,25 +63,33 @@ FetchContent_Declare(
     duckdb
     URL https://github.com/duckdb/duckdb/archive/refs/tags/v1.2.0.tar.gz
 )
+set(ENABLE_SANITIZER OFF)
+set(ENABLE_UBSAN OFF)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc|powerpc|ppc64|ppc64le")
     message("Disabling jemalloc extension of DuckDB on Power.")
     set(SKIP_EXTENSIONS jemalloc)
 endif()
 FetchContent_MakeAvailable(duckdb)
 
+# Include all sources from /src directory. CONFIGURE_DEPENDS can be unreliable.
+# Try re-running cmake in case changes are not recognized.
+file(GLOB SIGMODPC_SRC
+    CONFIGURE_DEPENDS
+    "src/*.cpp"
+)
+
 add_executable(
     run
 
-    src/build_table.cpp
-    src/csv_parser.cpp
-    src/statement.cpp
-    src/execute.cpp
+    ${SIGMODPC_SRC}
     tests/read_sql.cpp
 )
 
 target_include_directories(run PRIVATE include)
 target_link_libraries(run PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser duckdb)
-target_compile_definitions(run PRIVATE -D_CRT_SECURE_NO_WARNINGS)
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+    target_compile_definitions(run PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
 
 add_executable(
     build_database
@@ -91,17 +99,19 @@ add_executable(
 
 target_include_directories(build_database PRIVATE include)
 target_link_libraries(build_database PRIVATE fmt duckdb)
-target_compile_definitions(build_database PRIVATE -D_CRT_SECURE_NO_WARNINGS)
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+    target_compile_definitions(build_database PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
 
 add_executable(
     unit_tests
 
-    src/build_table.cpp
-    src/csv_parser.cpp
-    src/execute.cpp
+    ${SIGMODPC_SRC}
     tests/unit_tests.cpp
 )
 
 target_include_directories(unit_tests PRIVATE include)
 target_link_libraries(unit_tests PRIVATE range-v3 fmt Catch2::Catch2WithMain duckdb)
-target_compile_definitions(unit_tests PRIVATE -D_CRT_SECURE_NO_WARNINGS)
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+    target_compile_definitions(unit_tests PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()

@@ -148,6 +148,192 @@ struct Plan {
     }
 };
 
+template <class T>
+struct ColumnInserter {
+    Column&              column;
+    size_t               last_page_idx = 0;
+    uint16_t             num_rows      = 0;
+    size_t               data_end      = data_begin();
+    std::vector<uint8_t> bitmap;
+
+    constexpr static size_t data_begin() {
+        if (sizeof(T) < 4) {
+            return 4;
+        } else {
+            return sizeof(T);
+        }
+    }
+
+    ColumnInserter(Column& column)
+    : column(column) {
+        bitmap.resize(PAGE_SIZE);
+    }
+
+    std::byte* get_page() {
+        if (last_page_idx == column.pages.size()) [[unlikely]] {
+            column.new_page();
+        }
+        auto* page = column.pages[last_page_idx];
+        return page->data;
+    }
+
+    void save_page() {
+        auto* page                         = get_page();
+        *reinterpret_cast<uint16_t*>(page) = num_rows;
+        *reinterpret_cast<uint16_t*>(page + 2) =
+            static_cast<uint16_t>((data_end - data_begin()) / sizeof(T));
+        size_t bitmap_size = (num_rows + 7) / 8;
+        memcpy(page + PAGE_SIZE - bitmap_size, bitmap.data(), bitmap_size);
+        ++last_page_idx;
+        num_rows = 0;
+        data_end = data_begin();
+    }
+
+    void set_bitmap(size_t idx) {
+        size_t byte_idx   = idx / 8;
+        size_t bit_idx    = idx % 8;
+        bitmap[byte_idx] |= (0x1 << bit_idx);
+    }
+
+    void unset_bitmap(size_t idx) {
+        size_t byte_idx   = idx / 8;
+        size_t bit_idx    = idx % 8;
+        bitmap[byte_idx] &= ~(0x1 << bit_idx);
+    }
+
+    void insert(T value) {
+        if (data_end + 4 + num_rows / 8 + 1 > PAGE_SIZE) [[unlikely]] {
+            save_page();
+        }
+        auto* page                              = get_page();
+        *reinterpret_cast<T*>(page + data_end)  = value;
+        data_end                               += sizeof(T);
+        set_bitmap(num_rows);
+        ++num_rows;
+    }
+
+    void insert_null() {
+        if (data_end + num_rows / 8 + 1 > PAGE_SIZE) [[unlikely]] {
+            save_page();
+        }
+        unset_bitmap(num_rows);
+        ++num_rows;
+    }
+
+    void finalize() {
+        if (num_rows != 0) {
+            save_page();
+        }
+    }
+};
+
+template <>
+struct ColumnInserter<std::string> {
+    Column&              column;
+    size_t               last_page_idx = 0;
+    uint16_t             num_rows      = 0;
+    uint16_t             data_size     = 0;
+    size_t               offset_end    = 4;
+    std::vector<char>    data;
+    std::vector<uint8_t> bitmap;
+
+    constexpr static size_t offset_begin() { return 4; }
+
+    ColumnInserter(Column& column)
+    : column(column) {
+        data.resize(PAGE_SIZE);
+        bitmap.resize(PAGE_SIZE);
+    }
+
+    std::byte* get_page() {
+        if (last_page_idx == column.pages.size()) [[unlikely]] {
+            column.new_page();
+        }
+        auto* page = column.pages[last_page_idx];
+        return page->data;
+    }
+
+    void save_long_string(std::string_view value) {
+        size_t offset     = 0;
+        auto   first_page = true;
+        while (offset < value.size()) {
+            auto* page = get_page();
+            if (first_page) {
+                *reinterpret_cast<uint16_t*>(page) = 0xffff;
+                first_page                         = false;
+            } else {
+                *reinterpret_cast<uint16_t*>(page) = 0xfffe;
+            }
+            auto page_data_len = std::min(value.size() - offset, PAGE_SIZE - 4);
+            *reinterpret_cast<uint16_t*>(page + 2) = page_data_len;
+            memcpy(page + 4, value.data() + offset, page_data_len);
+            offset += page_data_len;
+            ++last_page_idx;
+        }
+    }
+
+    void save_page() {
+        auto* page                         = get_page();
+        *reinterpret_cast<uint16_t*>(page) = num_rows;
+        *reinterpret_cast<uint16_t*>(page + 2) =
+            static_cast<uint16_t>((offset_end - offset_begin()) / 2);
+        size_t bitmap_size = (num_rows + 7) / 8;
+        memcpy(page + offset_end, data.data(), data_size);
+        memcpy(page + PAGE_SIZE - bitmap_size, bitmap.data(), bitmap_size);
+        ++last_page_idx;
+        num_rows   = 0;
+        data_size  = 0;
+        offset_end = offset_begin();
+    }
+
+    void set_bitmap(size_t idx) {
+        size_t byte_idx   = idx / 8;
+        size_t bit_idx    = idx % 8;
+        bitmap[byte_idx] |= (0x1 << bit_idx);
+    }
+
+    void unset_bitmap(size_t idx) {
+        size_t byte_idx   = idx / 8;
+        size_t bit_idx    = idx % 8;
+        bitmap[byte_idx] &= ~(0x1 << bit_idx);
+    }
+
+    void insert(std::string_view value) {
+        if (value.size() > PAGE_SIZE - 7) {
+            if (num_rows > 0) {
+                save_page();
+            }
+            save_long_string(value);
+        } else {
+            if (offset_end + sizeof(uint16_t) + data_size + value.size() + num_rows / 8 + 1
+                > PAGE_SIZE) {
+                save_page();
+            }
+            memcpy(data.data() + data_size, value.data(), value.size());
+            data_size  += static_cast<uint16_t>(value.size());
+            auto* page  = get_page();
+            *reinterpret_cast<uint16_t*>(page + offset_end)  = data_size;
+            offset_end                                      += sizeof(uint16_t);
+            set_bitmap(num_rows);
+            ++num_rows;
+        }
+    }
+
+    void insert_null() {
+        if (offset_end + data_size + num_rows / 8 + 1 > PAGE_SIZE) [[unlikely]] {
+            save_page();
+        }
+        unset_bitmap(num_rows);
+        ++num_rows;
+    }
+
+    void finalize() {
+        if (num_rows != 0) {
+            save_page();
+        }
+    }
+};
+
 namespace Contest {
 
 void* build_context();

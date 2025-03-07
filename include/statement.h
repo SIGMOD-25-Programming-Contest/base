@@ -1,12 +1,11 @@
 #pragma once
 
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <variant>
 #include <vector>
-#include <unordered_map>
 
 #include <fmt/core.h>
 #include <re2/re2.h>
@@ -14,16 +13,41 @@
 using Data    = std::variant<int32_t, int64_t, double, std::string, std::monostate>;
 using Literal = std::variant<int64_t, double, std::string, std::monostate>;
 
+template <>
+struct fmt::formatter<Data> {
+    template <class ParseContext>
+    constexpr auto parse(ParseContext& ctx) {
+        return ctx.begin();
+    }
+
+    template <class FormatContext>
+    auto format(const Data& value, FormatContext& ctx) const {
+        return std::visit(
+            [&ctx](const auto& value) {
+                using T = std::decay_t<decltype(value)>;
+                if constexpr (std::is_same_v<T, std::monostate>) {
+                    return fmt::format_to(ctx.out(), "NULL");
+                } else {
+                    return fmt::format_to(ctx.out(), "{}", value);
+                }
+            },
+            value);
+    }
+};
+
 struct Attribute;
 struct Statement;
 struct Comparison;
 struct LogicalOperation;
+struct InnerColumnBase;
 
 // AST Node
 struct Statement {
-    virtual ~Statement()                                            = default;
-    virtual std::string pretty_print(int indent = 0) const          = 0;
-    virtual bool        eval(const std::vector<Data>& record) const = 0;
+    virtual ~Statement()                                                     = default;
+    virtual std::string          pretty_print(int indent = 0) const          = 0;
+    virtual bool                 eval(const std::vector<Data>& record) const = 0;
+    virtual std::vector<uint8_t> eval(
+        const std::vector<const InnerColumnBase*>& table) const = 0;
 };
 
 struct Comparison: Statement {
@@ -54,9 +78,9 @@ struct Comparison: Statement {
         return fmt::format("{:{}}{} {} {}", "", indent, column, opToString(), valueToString());
     }
 
-    bool eval(const std::vector<Data>& record) const override;
+    bool                 eval(const std::vector<Data>& record) const override;
+    std::vector<uint8_t> eval(const std::vector<const InnerColumnBase*>& table) const override;
 
-private:
     std::string opToString() const {
         switch (op) {
         case EQ:          return "=";
@@ -91,20 +115,14 @@ private:
             value);
     }
 
-    static bool like_match(const std::string& str, const std::string& pattern) {
+    static bool like_match(std::string_view str, const std::string& pattern) {
         // static cache and mutex
-        static std::mutex cache_mutex;
-        static auto       regex_cache = std::unordered_map<std::string, std::shared_ptr<RE2>>{};
+        thread_local auto regex_cache = std::unordered_map<std::string, std::unique_ptr<RE2>>{};
 
-        std::shared_ptr<RE2> re;
-
-        // check cache
-        {
-            std::lock_guard<std::mutex> lock(cache_mutex);
-            auto                        it = regex_cache.find(pattern);
-            if (it != regex_cache.end()) {
-                re = it->second;
-            }
+        const RE2* re = nullptr;
+        auto       it = regex_cache.find(pattern);
+        if (it != regex_cache.end()) {
+            re = it->second.get();
         }
 
         // cache miss and compile
@@ -120,7 +138,7 @@ private:
                     // escape sepcical characters
                     if (c == '\\' || c == '.' || c == '^' || c == '$' || c == '|' || c == '?'
                         || c == '*' || c == '+' || c == '(' || c == ')' || c == '[' || c == ']'
-                        || c == '{' || c == '}' || c == ' ') {
+                        || c == '{' || c == '}') {
                         regex_str += '\\';
                     }
                     regex_str += c;
@@ -129,19 +147,13 @@ private:
 
             RE2::Options options;
 
-            auto new_re = std::make_shared<RE2>(regex_str, options);
+            auto new_re = std::make_unique<RE2>(regex_str, options);
             if (!new_re->ok()) {
                 return false; // invalid regex
             }
 
-            // avoid duplicate insertion
-            std::lock_guard<std::mutex> lock(cache_mutex);
-            if (auto itr = regex_cache.find(pattern); itr == regex_cache.end()) {
-                auto [it, _] = regex_cache.emplace(pattern, new_re);
-                re           = it->second;
-            } else {
-                re = itr->second;
-            }
+            re = new_re.get();
+            regex_cache.emplace(pattern, std::move(new_re));
         }
 
         // execute full match
@@ -228,5 +240,6 @@ struct LogicalOperation: Statement {
         return result;
     }
 
-    bool eval(const std::vector<Data>& record) const override;
+    bool                 eval(const std::vector<Data>& record) const override;
+    std::vector<uint8_t> eval(const std::vector<const InnerColumnBase*>& table) const override;
 };

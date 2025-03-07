@@ -106,8 +106,8 @@ TEST_CASE("Empty Result", "[join]") {
         {6,},
     };
     std::vector<DataType> types{DataType::INT32};
-    Table table1(std::move(data1), std::move(types));
-    Table table2(std::move(data1), std::move(types));
+    Table table1(std::move(data1), types);
+    Table table2(std::move(data2), std::move(types));
     ColumnarTable input1 = table1.to_columnar();
     ColumnarTable input2 = table2.to_columnar();
     plan.inputs.emplace_back(std::move(input1));

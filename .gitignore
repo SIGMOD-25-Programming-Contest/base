@@ -6,3 +6,4 @@
 /*.db
 /TPC-H*
 /job-sample
+/.cache

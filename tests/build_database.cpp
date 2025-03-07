@@ -9,6 +9,7 @@ int main(int argc, char* argv[]) {
 
     if (argc < 2) {
         fmt::println(stderr, "Usage: {} <DuckDB database file>", argv[0]);
+        exit(EXIT_FAILURE);
     }
 
     auto schema = read_file(fs::path("job") / "schema.sql");
