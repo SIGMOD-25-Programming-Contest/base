@@ -1,3 +1,4 @@
+#include <hardware.h>
 #include <plan.h>
 #include <table.h>
 

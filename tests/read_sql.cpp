@@ -1316,7 +1316,7 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        if (write_output_file) {
+        if (all_queries_succeeded && write_output_file) {
             auto output_file = std::ofstream(output_filename);
             output_file << runtime;
             output_file.close();
