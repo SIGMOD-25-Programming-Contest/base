@@ -161,3 +161,4 @@ The evaluation is automatically executed on four different servers. On multi-soc
 
 
 For the final evaluation after the submission deadline, four additional servers will be included. These additional servers cover the same platforms but might differ in the supported feature set as they can be significantly older or newer than the initial servers.
+All servers run Ubuntu Linux with versions ranging from 20.04 to 24.04. Code is compiled with Clang 18.
