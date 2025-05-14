@@ -147,19 +147,31 @@ Now, you can run the tests:
 
 The evaluation is automatically executed on four different servers. On multi-socket machines, the benchmarks are bound to a single socket (using `numactl -m 0 -N 0`).
 
- * **Intel #1**
-    * CPU: 4x Intel Xeon E7-4880 v2 (SMT 2, 15 cores, 30 threads)
-    * Main memory: 512 GB
  * **AMD #1**
     * CPU: 2x AMD EPYC 7F72 (SMT 2, 24 cores, 48 threads)
     * Main memory: 256 GB
- * **IBM #1**
-    * CPU: 8x IBM Power8 (SMT 8, 12 cores, 96 threads)
-    * Main memory: 1024 GB
  * **ARM #1**
     * CPU: 1x Ampere Altra Max (SMT 1, 128 cores, 128 threads)
     * Main memory: 512 GB
+ * **IBM #1**
+    * CPU: 8x IBM Power8 (SMT 8, 12 cores, 96 threads)
+    * Main memory: 1024 GB
+ * **Intel #1**
+    * CPU: 4x Intel Xeon E7-4880 v2 (SMT 2, 15 cores, 30 threads)
+    * Main memory: 512 GB
 
+Additional Evaluation Server:
+ * **AMD #2**
+    * CPU: 1x AMD EPYC 7343 (SMT 2, 16 cores, 32 threads; 20 threads enabled)
+    * Main memory: 96 GB
+ * **ARM #2**
+    * CPU: 1x NVIDIA GH200 Grace Hopper (SMT 1, 72 cores, 72 threads)
+    * Main memory: 480 GB
+ * **IBM #2**
+    * CPU: 2x IBM Power10 (SMT 8, 12 cores, 96 threads)
+    * Main memory: 512 GB
+ * **Intel #2**
+    * CPU: 2x Intel Xeon Platinum 8352Y (SMT 2, 32 cores, 64 threads)
+    * Main memory: 256 GB
 
-For the final evaluation after the submission deadline, four additional servers will be included. These additional servers cover the same platforms but might differ in the supported feature set as they can be significantly older or newer than the initial servers.
-All servers run Ubuntu Linux with versions ranging from 20.04 to 24.04. Code is compiled with Clang 18.
+Code is compiled with Clang 18.
